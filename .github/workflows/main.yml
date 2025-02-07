@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.14  # ใช้เวอร์ชันที่เข้ากันได้กับ Milvus
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=5000
+      - ETCD_QUOTA_BACKEND_BYTES=8589934592
+      - ETCD_SNAPSHOT_COUNT=100000
+    volumes:
+      - ./volumes/etcd:/etcd
+    command: >
+      etcd
+      --advertise-client-urls=http://0.0.0.0:2379
+      --listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    healthcheck:
+      test: [ "CMD", "etcdctl", "endpoint", "health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - milvus-network
+
+  minio:
+    container_name: milvus-minio
+    image: quay.io/minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./volumes/minio:/minio_data
+    command: minio server /minio_data/data1 /minio_data/data2 /minio_data/data3 /minio_data/data4 --console-address ":9001"
+    networks:
+      - milvus-network
+
+
+  milvus-standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.5.4  # ใช้ Milvus v2.5.4
+    command: [ "milvus", "run", "standalone" ]
+    environment:
+      - ETCD_ENDPOINTS=http://etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - MINIO_REGION=us-east-1
+      - MINIO_USE_SSL=false  # ใช้ MinIO แบบไม่มี SSL (ถ้าใช้ SSL ต้องตั้งค่า certs)
+      - LOG_LEVEL=info  # ลด log ที่ไม่จำเป็น
+      - CACHE_SIZE=4GB  # ตั้งค่าขนาด cache (ปรับตาม RAM ของเครื่อง)
+    volumes:
+      - ./volumes/milvus:/var/lib/milvus
+      - /etc/localtime:/etc/localtime:ro  # Mount เวลาของเครื่อง host
+    ports:
+      - "19530:19530"  # Milvus API
+      - "9091:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - milvus-network
+
+  streamlit:
+    build: .
+    container_name: milvus-streamlit
+    environment:
+      - MILVUS_HOST=milvus-standalone
+      - MILVUS_PORT=19530
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./BGE-M3:/app/BGE-M3
+      - ~/.aws:/root/.aws
+      - ./app.py:/app/app.py  # Mount โค้ดให้แก้ไขได้โดยไม่ต้อง build ใหม่
+      - /etc/localtime:/etc/localtime:ro  # Mount เวลาของเครื่อง host
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - milvus-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # ใช้ GPU ทุกตัวที่มี
+              capabilities: [ gpu ]
+
+networks:
+  milvus-network:
+    driver: bridge  # ให้ทุก service ใช้ network เดียวกัน
